@@ -8,8 +8,27 @@ import {
   getBenchmarksByCategory,
 } from "../generator/benchmark-library.js";
 import { buildSession } from "../generator/session-builder.js";
+import {
+  generateFiveThreeOneDay,
+  generateFiveThreeOneWeek,
+  generateStrongLiftsDay,
+} from "../frameworks/strength.js";
+import type { FiveThreeOneConfig } from "../frameworks/strength.js";
+import {
+  getRunPlan,
+  getRunWeek,
+  runWorkoutToSession,
+  RUN_PLAN_INFO,
+} from "../frameworks/running.js";
+import type { RunPlanType } from "../frameworks/running.js";
+import {
+  getSplitDays,
+  generateSplitDay,
+  SPLIT_INFO,
+} from "../frameworks/bodybuilding.js";
+import type { SplitType } from "../frameworks/bodybuilding.js";
 import { createAthlete, Sex } from "../models/athlete.js";
-import type { Workout } from "../models/workout.js";
+import type { Workout, TrainingSession } from "../models/workout.js";
 import { WorkoutFormat, ScoreType } from "../models/workout.js";
 import { EQUIPMENT_PRESETS } from "../models/equipment.js";
 import { DifficultyTier } from "../models/movement.js";
@@ -948,6 +967,271 @@ program
 
     console.log("\n" + "═".repeat(55) + "\n");
   });
+
+// ─── PROGRAM ─────────────────────────────────────────────────────
+
+const programCmd = program
+  .command("program")
+  .alias("pgm")
+  .description("Multi-framework training programs (strength, running, bodybuilding)");
+
+// --- 5/3/1 Strength ---
+
+programCmd
+  .command("531")
+  .description("Generate a 5/3/1 strength training day or week")
+  .requiredOption("--squat <lbs>", "Squat training max")
+  .requiredOption("--bench <lbs>", "Bench press training max")
+  .requiredOption("--deadlift <lbs>", "Deadlift training max")
+  .requiredOption("--press <lbs>", "Overhead press training max")
+  .option("-w, --week <1-4>", "Week in the cycle (1=5s, 2=3s, 3=5/3/1, 4=deload)", "1")
+  .option("-l, --lift <lift>", "Single lift (squat, bench, deadlift, press) instead of full week")
+  .option("--no-bbb", "Skip Boring But Big accessory work")
+  .action((opts) => {
+    const config: FiveThreeOneConfig = {
+      trainingMax: {
+        squat: parseInt(opts.squat, 10),
+        bench: parseInt(opts.bench, 10),
+        deadlift: parseInt(opts.deadlift, 10),
+        press: parseInt(opts.press, 10),
+      },
+      week: parseInt(opts.week, 10) as 1 | 2 | 3 | 4,
+      includeBBB: opts.bbb !== false,
+    };
+
+    if (opts.lift) {
+      const session = generateFiveThreeOneDay(opts.lift, config);
+      displaySession(session);
+    } else {
+      const sessions = generateFiveThreeOneWeek(config);
+      console.log("\n" + "═".repeat(55));
+      console.log(`  5/3/1 Week ${config.week} Program`);
+      console.log("═".repeat(55));
+      for (const session of sessions) {
+        console.log("");
+        displaySession(session);
+      }
+    }
+  });
+
+// --- StrongLifts ---
+
+programCmd
+  .command("stronglifts")
+  .alias("sl")
+  .description("Generate a StrongLifts 5x5 day (A/B split)")
+  .requiredOption("--squat <lbs>", "Squat weight")
+  .requiredOption("--bench <lbs>", "Bench press weight")
+  .requiredOption("--row <lbs>", "Row weight")
+  .requiredOption("--press <lbs>", "Overhead press weight")
+  .requiredOption("--deadlift <lbs>", "Deadlift weight")
+  .option("-d, --day <A|B>", "Day A or B", "A")
+  .action((opts) => {
+    const session = generateStrongLiftsDay(opts.day.toUpperCase() as "A" | "B", {
+      squat: parseInt(opts.squat, 10),
+      bench: parseInt(opts.bench, 10),
+      row: parseInt(opts.row, 10),
+      press: parseInt(opts.press, 10),
+      deadlift: parseInt(opts.deadlift, 10),
+    });
+    displaySession(session);
+  });
+
+// --- Running ---
+
+programCmd
+  .command("run")
+  .description("Running programs (Couch to 5K, 5K improvement, etc.)")
+  .option(
+    "-p, --plan <type>",
+    "Plan type: couch_to_5k, 5k_improvement",
+    "couch_to_5k"
+  )
+  .option("-w, --week <number>", "Show a specific week")
+  .option("-d, --day <1-7>", "Show a specific day within the week")
+  .option("--list", "List available plans")
+  .action((opts) => {
+    if (opts.list) {
+      console.log("\nAvailable running plans:\n");
+      for (const [key, info] of Object.entries(RUN_PLAN_INFO)) {
+        console.log(`  ${key.padEnd(20)} ${info.name} (${info.weeks} weeks)`);
+        console.log(`  ${"".padEnd(20)} ${info.description}`);
+        console.log();
+      }
+      return;
+    }
+
+    const planType = opts.plan as RunPlanType;
+    const planInfo = RUN_PLAN_INFO[planType];
+
+    if (!planInfo) {
+      console.error(`\nUnknown plan: "${opts.plan}"`);
+      console.error("Use --list to see available plans.\n");
+      process.exit(1);
+    }
+
+    if (opts.week) {
+      const weekNum = parseInt(opts.week, 10);
+      const week = getRunWeek(planType, weekNum);
+
+      if (!week) {
+        console.error(`\nWeek ${weekNum} not found in ${planInfo.name} plan.`);
+        console.error(`This plan has ${planInfo.weeks} weeks.\n`);
+        process.exit(1);
+      }
+
+      if (opts.day) {
+        const dayIdx = parseInt(opts.day, 10) - 1;
+        if (dayIdx < 0 || dayIdx >= week.days.length) {
+          console.error(`\nDay must be 1-${week.days.length}.\n`);
+          process.exit(1);
+        }
+        const session = runWorkoutToSession(week.days[dayIdx], weekNum, dayIdx);
+        displaySession(session);
+      } else {
+        // Show full week
+        console.log("\n" + "═".repeat(55));
+        console.log(`  ${planInfo.name} - Week ${weekNum}`);
+        console.log(`  Total distance: ~${week.totalDistanceKm} km`);
+        if (week.notes) console.log(`  Note: ${week.notes}`);
+        console.log("═".repeat(55));
+
+        const dayNames = ["Mon", "Tue", "Wed", "Thu", "Fri", "Sat", "Sun"];
+        for (let i = 0; i < week.days.length; i++) {
+          const d = week.days[i];
+          const dist = d.distanceKm ? ` (${d.distanceKm} km)` : "";
+          const dur = d.durationMinutes > 0 ? ` - ${d.durationMinutes} min` : "";
+          console.log(`\n  ${dayNames[i]}: ${d.type.toUpperCase()}${dur}${dist}`);
+          console.log(`    ${d.description}`);
+          if (d.intervals) {
+            console.log(`    ${d.intervals.repeats}x ${d.intervals.work} / ${d.intervals.rest}`);
+          }
+        }
+        console.log("\n" + "═".repeat(55) + "\n");
+      }
+    } else {
+      // Show plan overview
+      const plan = getRunPlan(planType);
+      console.log("\n" + "═".repeat(55));
+      console.log(`  ${planInfo.name}`);
+      console.log(`  ${planInfo.description}`);
+      console.log("═".repeat(55));
+
+      for (const week of plan) {
+        const runDays = week.days.filter((d) => d.type !== "rest").length;
+        console.log(
+          `\n  Week ${week.weekNumber}: ${runDays} run days, ~${week.totalDistanceKm} km total${week.notes ? ` (${week.notes})` : ""}`
+        );
+        const dayNames = ["Mon", "Tue", "Wed", "Thu", "Fri", "Sat", "Sun"];
+        for (let i = 0; i < week.days.length; i++) {
+          const d = week.days[i];
+          if (d.type !== "rest") {
+            console.log(`    ${dayNames[i]}: ${d.description}`);
+          }
+        }
+      }
+      console.log(`\n  View a week: wod program run -p ${planType} -w 1`);
+      console.log(`  View a day:  wod program run -p ${planType} -w 1 -d 1\n`);
+    }
+  });
+
+// --- Bodybuilding Splits ---
+
+programCmd
+  .command("split")
+  .description("Bodybuilding splits (PPL, Upper/Lower, Full Body)")
+  .option(
+    "-s, --split <type>",
+    "Split type: ppl, upper_lower, full_body",
+    "ppl"
+  )
+  .option("-d, --day <number>", "Generate a specific day (1-indexed)")
+  .option("--list", "List available splits")
+  .action((opts) => {
+    if (opts.list) {
+      console.log("\nAvailable bodybuilding splits:\n");
+      for (const [key, info] of Object.entries(SPLIT_INFO)) {
+        console.log(`  ${key.padEnd(16)} ${info.name} (${info.daysPerWeek} days/week)`);
+        console.log(`  ${"".padEnd(16)} ${info.description}`);
+        console.log();
+      }
+      return;
+    }
+
+    const splitType = opts.split as SplitType;
+    const splitInfo = SPLIT_INFO[splitType];
+
+    if (!splitInfo) {
+      console.error(`\nUnknown split: "${opts.split}"`);
+      console.error("Use --list to see available splits.\n");
+      process.exit(1);
+    }
+
+    const days = getSplitDays(splitType);
+
+    if (opts.day) {
+      const dayIdx = parseInt(opts.day, 10) - 1;
+      if (dayIdx < 0 || dayIdx >= days.length) {
+        console.error(`\nDay must be 1-${days.length} for ${splitInfo.name}.\n`);
+        process.exit(1);
+      }
+      const session = generateSplitDay(splitType, dayIdx);
+      displaySession(session);
+    } else {
+      // Show split overview
+      console.log("\n" + "═".repeat(55));
+      console.log(`  ${splitInfo.name}`);
+      console.log(`  ${splitInfo.daysPerWeek} days per week`);
+      console.log(`  ${splitInfo.description}`);
+      console.log("═".repeat(55));
+
+      for (let i = 0; i < days.length; i++) {
+        const day = days[i];
+        console.log(`\n  Day ${i + 1}: ${day.name} (~${day.estimatedDuration} min)`);
+        console.log(`  Focus: ${day.focus}`);
+        for (const ex of day.exercises) {
+          const name = getMovement(ex.movementId)?.name ?? ex.movementId;
+          const note = ex.notes ? ` (${ex.notes})` : "";
+          console.log(`    ${ex.sets}x${ex.reps} ${name}${note}`);
+        }
+      }
+
+      console.log(`\n  Generate a day: wod program split -s ${splitType} -d 1\n`);
+    }
+  });
+
+/**
+ * Display a training session to the console.
+ */
+function displaySession(session: TrainingSession): void {
+  console.log("\n" + "═".repeat(55));
+  console.log(`  ${session.notes ?? "Training Session"}`);
+  console.log(`  ${session.date} - ~${session.totalDurationMinutes} min`);
+  console.log("═".repeat(55));
+
+  for (const block of session.blocks) {
+    const label = block.type.replace(/_/g, " ").toUpperCase();
+    if (block.durationMinutes === 0 && !block.workout) {
+      console.log(`\n  ── ${label} ──`);
+    } else {
+      console.log(`\n  ── ${label} (~${block.durationMinutes} min) ──`);
+    }
+
+    if (block.workout) {
+      for (const line of formatWorkoutDisplay(block.workout).split("\n")) {
+        console.log(`  ${line}`);
+      }
+    }
+
+    if (block.notes && !block.workout) {
+      for (const line of block.notes.split("\n")) {
+        console.log(`    ${line}`);
+      }
+    }
+  }
+
+  console.log("\n" + "═".repeat(55) + "\n");
+}
 
 // ─── Formatting Helpers ───────────────────────────────────────────
 

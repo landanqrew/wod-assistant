@@ -1,6 +1,6 @@
 # WOD Assistant
 
-A CLI fitness programming utility for CrossFit-style workouts. Generate workouts, browse benchmark WODs, build full training sessions with warm-ups, log results, track personal records, monitor training volume, detect programming biases, and visualize progress -- all stored locally in SQLite.
+A CLI fitness programming utility for CrossFit-style workouts and beyond. Generate workouts, browse benchmark WODs, build full training sessions with warm-ups, follow structured strength programs (5/3/1, StrongLifts), running plans (Couch to 5K), and bodybuilding splits (PPL, Upper/Lower) -- plus log results, track PRs, monitor volume, detect biases, and visualize progress. All stored locally in SQLite.
 
 ## Install
 
@@ -45,6 +45,11 @@ wod insights
 
 # 7. Visualize progress
 wod progress
+
+# 8. Follow a structured program
+wod program 531 -s 300 -b 200 -d 400 -p 150
+wod program run -p couch_to_5k -w 1
+wod program split -t ppl -d 0
 ```
 
 ## Commands
@@ -281,6 +286,84 @@ wod progress -d 60                     # last 2 months
 wod progress -m back_squat             # back squat load chart
 ```
 
+### `wod program`
+
+Access structured training programs beyond WODs: strength programming, running plans, and bodybuilding splits.
+
+#### `wod program 531`
+
+Generate a Wendler 5/3/1 training day or full week. Calculates working sets from your training maxes using the standard percentage scheme.
+
+```
+Options:
+  -s, --squat <lbs>           Squat training max (required)
+  -b, --bench <lbs>           Bench training max (required)
+  -d, --deadlift <lbs>        Deadlift training max (required)
+  -p, --press <lbs>           Press training max (required)
+  -w, --week <1-4>            Week in cycle: 1=5s, 2=3s, 3=5/3/1, 4=Deload (default: 1)
+  -l, --lift <lift>           Single lift: squat | bench | deadlift | press (default: full week)
+  --no-bbb                    Skip Boring But Big accessory work
+```
+
+```bash
+wod program 531 -s 300 -b 200 -d 400 -p 150           # full week 1
+wod program 531 -s 300 -b 200 -d 400 -p 150 -w 3      # 5/3/1 week
+wod program 531 -s 300 -b 200 -d 400 -p 150 -l squat  # squat day only
+```
+
+#### `wod program stronglifts`
+
+Generate a StrongLifts 5x5 A/B day with your current working weights.
+
+```
+Options:
+  -s, --squat <lbs>           Squat weight (required)
+  -b, --bench <lbs>           Bench weight (required)
+  -r, --row <lbs>             Row weight (required)
+  -p, --press <lbs>           Press weight (required)
+  -d, --deadlift <lbs>        Deadlift weight (required)
+  --day <A|B>                 Day A or B (default: A)
+```
+
+```bash
+wod program stronglifts -s 225 -b 185 -r 135 -p 115 -d 315 --day A
+wod program stronglifts -s 225 -b 185 -r 135 -p 115 -d 315 --day B
+```
+
+#### `wod program run`
+
+Follow a structured running plan with progressive weekly programming.
+
+```
+Options:
+  -p, --plan <plan>           couch_to_5k | 5k_improvement (default: couch_to_5k)
+  -w, --week <number>         Week number (default: 1)
+  -d, --day <number>          Day of week, 0=Mon (default: 0)
+```
+
+```bash
+wod program run -p couch_to_5k -w 1                    # full week overview
+wod program run -p couch_to_5k -w 1 -d 0               # Monday's workout
+wod program run -p 5k_improvement -w 3                  # week 3 overview
+```
+
+#### `wod program split`
+
+Follow a bodybuilding split with structured hypertrophy programming.
+
+```
+Options:
+  -t, --type <split>          ppl | upper_lower | full_body (default: ppl)
+  -d, --day <index>           Day index in the split (default: 0)
+```
+
+```bash
+wod program split -t ppl -d 0                           # Push Day
+wod program split -t ppl -d 1                           # Pull Day
+wod program split -t upper_lower -d 0                   # Upper A (Strength)
+wod program split -t full_body -d 2                     # Full Body C
+```
+
 ## Equipment Presets
 
 | Preset | Equipment Included |
@@ -308,6 +391,7 @@ npm run build         # compile TypeScript
 src/
   cli/          CLI commands (Commander.js)
   db/           SQLite connection, migrations, repositories
+  frameworks/   Strength programs (5/3/1, StrongLifts), running plans, bodybuilding splits
   generator/    Workout generation, benchmarks, warm-up engine, session builder
   models/       TypeScript interfaces and enums
   movements/    Movement library (68 movements)
