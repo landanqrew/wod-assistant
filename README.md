@@ -238,6 +238,43 @@ wod movements
 wod movements -m gymnastics
 ```
 
+### `wod insights`
+
+Analyze your training history for programming biases, movement gaps, and fatigue indicators. Surfaces issues like missing modalities, push/pull imbalances, RPE trends, and overtraining signals.
+
+```
+Options:
+  -d, --days <days>           Analysis period in days (default: 30)
+```
+
+```bash
+wod insights                           # 30-day analysis
+wod insights -d 14                     # last 2 weeks
+```
+
+Example output includes:
+- Alerts for missing modalities ("No gymnastics in 30 days")
+- Push/pull ratio warnings
+- RPE trend sparkline and averages
+- Training frequency analysis
+- Modality and muscle group distribution charts
+
+### `wod progress`
+
+Visualize training progress with ASCII charts: RPE over time, workout frequency per week, format mix, and per-movement load tracking.
+
+```
+Options:
+  -m, --movement <id>         Show load progress for a specific movement
+  -d, --days <days>           Number of days to chart (default: 30)
+```
+
+```bash
+wod progress                           # overall 30-day view
+wod progress -d 60                     # last 2 months
+wod progress -m back_squat             # back squat load chart
+```
+
 ## Equipment Presets
 
 | Preset | Equipment Included |

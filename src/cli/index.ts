@@ -21,6 +21,14 @@ import { WorkoutRepository } from "../db/workout-repository.js";
 import { ResultRepository } from "../db/result-repository.js";
 import { PRTracker } from "../tracking/pr-tracker.js";
 import { VolumeTracker } from "../tracking/volume-tracker.js";
+import { BiasDetector } from "../tracking/bias-detector.js";
+import { FatigueTracker } from "../tracking/fatigue-tracker.js";
+import {
+  barChart,
+  sparkline,
+  distributionChart,
+  timelineChart,
+} from "../tracking/progress-chart.js";
 import { createWorkoutResult } from "../models/workout-result.js";
 
 const program = new Command();
@@ -729,6 +737,216 @@ program
     }
 
     console.log("\n" + "═".repeat(50) + "\n");
+  });
+
+// ─── INSIGHTS ────────────────────────────────────────────────────
+
+program
+  .command("insights")
+  .description("Analyze training for biases, gaps, and fatigue indicators")
+  .option("-d, --days <days>", "Analysis period in days", "30")
+  .action((opts) => {
+    const db = getDb();
+    const a = resolveAthlete({});
+    const days = parseInt(opts.days, 10);
+
+    const biasDetector = new BiasDetector(db);
+    const fatigueTracker = new FatigueTracker(db);
+
+    const biasReport = biasDetector.analyze(a.id, days);
+    const fatigueReport = fatigueTracker.analyze(a.id);
+
+    console.log("\n" + "═".repeat(55));
+    console.log(`  Training Insights (last ${days} days)`);
+    console.log(`  ${biasReport.totalWorkouts} workouts analyzed`);
+    console.log("═".repeat(55));
+
+    // Bias insights
+    const allInsights = [
+      ...biasReport.insights,
+      ...fatigueReport.insights,
+    ];
+
+    if (allInsights.length === 0) {
+      console.log("\n  No issues detected. Keep training!\n");
+    } else {
+      // Group by severity
+      const alerts = allInsights.filter((i) => i.severity === "alert" || i.severity === "warning");
+      const cautions = allInsights.filter((i) => i.severity === "caution");
+      const infos = allInsights.filter((i) => i.severity === "info" || i.severity === "good");
+
+      if (alerts.length > 0) {
+        console.log("\n  !! ALERTS !!");
+        for (const insight of alerts) {
+          console.log(`    ${insight.message}`);
+          console.log(`      -> ${insight.recommendation}`);
+        }
+      }
+
+      if (cautions.length > 0) {
+        console.log("\n  ! CAUTIONS");
+        for (const insight of cautions) {
+          console.log(`    ${insight.message}`);
+          console.log(`      -> ${insight.recommendation}`);
+        }
+      }
+
+      if (infos.length > 0) {
+        console.log("\n  Notes:");
+        for (const insight of infos) {
+          console.log(`    ${insight.message}`);
+          console.log(`      -> ${insight.recommendation}`);
+        }
+      }
+    }
+
+    // Modality distribution
+    if (biasReport.totalWorkouts > 0) {
+      console.log("\n" + distributionChart(
+        "Modality Distribution",
+        biasReport.modalityDistribution
+      ));
+
+      console.log("\n" + distributionChart(
+        "Muscle Group Distribution",
+        biasReport.muscleGroupDistribution
+      ));
+    }
+
+    // RPE trend
+    if (fatigueReport.rpeTrend.length > 0) {
+      console.log(`\n  RPE Trend: ${sparkline(fatigueReport.rpeTrend.map((p) => p.rpe))}`);
+      if (fatigueReport.weeklyRpeAvg !== null) {
+        console.log(`  7-day avg RPE: ${fatigueReport.weeklyRpeAvg}/10`);
+      }
+      if (fatigueReport.monthlyRpeAvg !== null) {
+        console.log(`  30-day avg RPE: ${fatigueReport.monthlyRpeAvg}/10`);
+      }
+      console.log(`  Load trend: ${fatigueReport.loadTrend.replace(/_/g, " ")}`);
+    }
+
+    // Top movements
+    if (biasReport.movementFrequency.length > 0) {
+      console.log("\n" + barChart(
+        "Most Used Movements",
+        biasReport.movementFrequency.slice(0, 8).map((m) => ({
+          label: m.name,
+          value: m.count,
+        })),
+        { unit: "x" }
+      ));
+    }
+
+    console.log("\n" + "═".repeat(55) + "\n");
+  });
+
+// ─── PROGRESS ────────────────────────────────────────────────────
+
+program
+  .command("progress")
+  .description("Visualize training progress over time")
+  .option("-m, --movement <id>", "Show progress for a specific movement")
+  .option("-d, --days <days>", "Number of days to show", "30")
+  .action((opts) => {
+    const db = getDb();
+    const a = resolveAthlete({});
+    const resultRepo = new ResultRepository(db);
+    const workoutRepo = new WorkoutRepository(db);
+    const days = parseInt(opts.days, 10);
+
+    const end = new Date();
+    const start = new Date(end);
+    start.setDate(start.getDate() - days);
+
+    const results = resultRepo.getByDateRange(
+      a.id,
+      start.toISOString(),
+      end.toISOString()
+    );
+
+    if (results.length === 0) {
+      console.log(`\nNo workouts in the last ${days} days.\n`);
+      return;
+    }
+
+    console.log("\n" + "═".repeat(55));
+    console.log(`  Progress Report (last ${days} days)`);
+    console.log("═".repeat(55));
+
+    // RPE over time chart
+    const rpeData = results
+      .filter((r) => r.rpe !== undefined)
+      .reverse()
+      .map((r) => ({
+        label: r.performedAt.split("T")[0].slice(5), // MM-DD
+        value: r.rpe!,
+      }));
+
+    if (rpeData.length >= 2) {
+      console.log("\n" + timelineChart("RPE Over Time", rpeData, { unit: "RPE (1-10)" }));
+    }
+
+    // Movement-specific progress
+    if (opts.movement) {
+      const movementName = getMovement(opts.movement)?.name ?? opts.movement;
+      const loadData: { label: string; value: number }[] = [];
+
+      for (const r of results.reverse()) {
+        for (const mr of r.movementResults) {
+          if (mr.movementId === opts.movement && mr.load) {
+            loadData.push({
+              label: r.performedAt.split("T")[0].slice(5),
+              value: mr.load,
+            });
+          }
+        }
+      }
+
+      if (loadData.length >= 2) {
+        console.log("\n" + timelineChart(`${movementName} Load`, loadData, { unit: "lbs" }));
+      } else if (loadData.length > 0) {
+        console.log(`\n  ${movementName}: ${loadData[0].value} lbs (only 1 data point)`);
+      } else {
+        console.log(`\n  No logged data for ${movementName} in this period.`);
+      }
+    }
+
+    // Workout frequency per week
+    const weekMap = new Map<string, number>();
+    for (const r of results) {
+      const date = new Date(r.performedAt);
+      const weekStart = new Date(date);
+      weekStart.setDate(weekStart.getDate() - weekStart.getDay());
+      const weekLabel = weekStart.toISOString().split("T")[0].slice(5);
+      weekMap.set(weekLabel, (weekMap.get(weekLabel) ?? 0) + 1);
+    }
+
+    const weekData = [...weekMap.entries()]
+      .sort(([a], [b]) => a.localeCompare(b))
+      .map(([label, count]) => ({ label: `wk ${label}`, value: count }));
+
+    if (weekData.length >= 2) {
+      console.log("\n" + barChart("Workouts per Week", weekData, { unit: "" }));
+    }
+
+    // Format distribution
+    const formatCounts = new Map<string, number>();
+    for (const r of results) {
+      const w = workoutRepo.getById(r.workoutId);
+      if (w) {
+        formatCounts.set(w.format, (formatCounts.get(w.format) ?? 0) + 1);
+      }
+    }
+
+    if (formatCounts.size > 0) {
+      const fmtDist: Record<string, number> = {};
+      for (const [fmt, count] of formatCounts) {
+        fmtDist[fmt] = Math.round((count / results.length) * 100);
+      }
+      console.log("\n" + distributionChart("Format Mix", fmtDist));
+    }
+
+    console.log("\n" + "═".repeat(55) + "\n");
   });
 
 // ─── Formatting Helpers ───────────────────────────────────────────
