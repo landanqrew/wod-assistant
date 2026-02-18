@@ -3,9 +3,19 @@
 import { Command } from "commander";
 import { generateWorkout } from "../generator/index.js";
 import { createAthlete, Sex } from "../models/athlete.js";
-import { WorkoutFormat } from "../models/workout.js";
+import type { Workout } from "../models/workout.js";
+import { WorkoutFormat, ScoreType } from "../models/workout.js";
 import { EQUIPMENT_PRESETS } from "../models/equipment.js";
-import { getAllMovements } from "../movements/library.js";
+import { DifficultyTier } from "../models/movement.js";
+import { getAllMovements, getMovement } from "../movements/library.js";
+import { scaleWorkoutToTier } from "../scaling/scaling-tiers.js";
+import { getDb } from "../db/connection.js";
+import { AthleteRepository } from "../db/athlete-repository.js";
+import { WorkoutRepository } from "../db/workout-repository.js";
+import { ResultRepository } from "../db/result-repository.js";
+import { PRTracker } from "../tracking/pr-tracker.js";
+import { VolumeTracker } from "../tracking/volume-tracker.js";
+import { createWorkoutResult } from "../models/workout-result.js";
 
 const program = new Command();
 
@@ -13,6 +23,113 @@ program
   .name("wod")
   .description("WOD Assistant - Multi-purpose fitness programming utility")
   .version("0.1.0");
+
+/**
+ * Resolve the current athlete. Uses the saved profile if one exists,
+ * otherwise falls back to a transient in-memory athlete.
+ */
+function resolveAthlete(opts: { sex?: string; equipment?: string }) {
+  const db = getDb();
+  const athleteRepo = new AthleteRepository(db);
+  const saved = athleteRepo.getDefault();
+
+  if (saved) return saved;
+
+  const equipMap: Record<string, Set<any>> = {
+    full_gym: EQUIPMENT_PRESETS.fullGym,
+    home_gym: EQUIPMENT_PRESETS.homeGym,
+    minimal: EQUIPMENT_PRESETS.minimal,
+    bodyweight: EQUIPMENT_PRESETS.bodyweight,
+  };
+
+  return createAthlete(
+    "cli_user",
+    "CLI User",
+    opts.sex === "female" ? Sex.Female : Sex.Male,
+    [...(equipMap[opts.equipment ?? "full_gym"] ?? EQUIPMENT_PRESETS.fullGym)]
+  );
+}
+
+// ─── ATHLETE ──────────────────────────────────────────────────────
+
+const athlete = program
+  .command("athlete")
+  .description("Manage your athlete profile");
+
+athlete
+  .command("create")
+  .description("Create or update your athlete profile")
+  .requiredOption("-n, --name <name>", "Your name")
+  .option("-s, --sex <sex>", "Sex (male, female)", "male")
+  .option(
+    "-e, --equipment <preset>",
+    "Equipment preset (full_gym, home_gym, minimal, bodyweight)",
+    "full_gym"
+  )
+  .option("-d, --duration <minutes>", "Preferred workout duration in minutes")
+  .action((opts) => {
+    const db = getDb();
+    const repo = new AthleteRepository(db);
+
+    const equipMap: Record<string, Set<any>> = {
+      full_gym: EQUIPMENT_PRESETS.fullGym,
+      home_gym: EQUIPMENT_PRESETS.homeGym,
+      minimal: EQUIPMENT_PRESETS.minimal,
+      bodyweight: EQUIPMENT_PRESETS.bodyweight,
+    };
+
+    const id = opts.name.toLowerCase().replace(/\s+/g, "_");
+    const a = createAthlete(
+      id,
+      opts.name,
+      opts.sex === "female" ? Sex.Female : Sex.Male,
+      [...(equipMap[opts.equipment] ?? EQUIPMENT_PRESETS.fullGym)]
+    );
+    if (opts.duration) {
+      a.preferredDuration = parseInt(opts.duration, 10);
+    }
+
+    repo.save(a);
+    console.log(`\nAthlete profile saved: ${a.name} (${a.id})`);
+    console.log(`  Sex: ${a.sex}`);
+    console.log(`  Equipment: ${opts.equipment}`);
+    if (a.preferredDuration) {
+      console.log(`  Preferred duration: ${a.preferredDuration} min`);
+    }
+    console.log();
+  });
+
+athlete
+  .command("show")
+  .description("Show your athlete profile")
+  .action(() => {
+    const db = getDb();
+    const repo = new AthleteRepository(db);
+    const resultRepo = new ResultRepository(db);
+    const a = repo.getDefault();
+
+    if (!a) {
+      console.log("\nNo athlete profile found. Create one with:");
+      console.log('  wod athlete create -n "Your Name"\n');
+      return;
+    }
+
+    const totalWorkouts = resultRepo.countByAthlete(a.id);
+
+    console.log("\n" + "═".repeat(40));
+    console.log(`  ${a.name}`);
+    console.log("═".repeat(40));
+    console.log(`  ID: ${a.id}`);
+    console.log(`  Sex: ${a.sex}`);
+    console.log(`  Equipment: ${[...a.equipment].join(", ") || "none"}`);
+    if (a.preferredDuration) {
+      console.log(`  Preferred duration: ${a.preferredDuration} min`);
+    }
+    console.log(`  Total workouts logged: ${totalWorkouts}`);
+    console.log("═".repeat(40) + "\n");
+  });
+
+// ─── GENERATE ─────────────────────────────────────────────────────
 
 program
   .command("generate")
@@ -33,30 +150,27 @@ program
   )
   .option("-s, --sex <sex>", "Sex for Rx loads (male, female)", "male")
   .action((opts) => {
-    const equipMap: Record<string, Set<any>> = {
-      full_gym: EQUIPMENT_PRESETS.fullGym,
-      home_gym: EQUIPMENT_PRESETS.homeGym,
-      minimal: EQUIPMENT_PRESETS.minimal,
-      bodyweight: EQUIPMENT_PRESETS.bodyweight,
-    };
-
-    const athlete = createAthlete(
-      "cli_user",
-      "CLI User",
-      opts.sex === "female" ? Sex.Female : Sex.Male,
-      [...(equipMap[opts.equipment] ?? EQUIPMENT_PRESETS.fullGym)]
-    );
+    const a = resolveAthlete(opts);
 
     const format = opts.format as WorkoutFormat;
-    const workout = generateWorkout(athlete, {
+    const workout = generateWorkout(a, {
       format,
       movementCount: parseInt(opts.movements, 10),
       timeCap: opts.time ? parseInt(opts.time, 10) : undefined,
       rounds: opts.rounds ? parseInt(opts.rounds, 10) : undefined,
     });
 
+    // Save workout to DB so it can be referenced by `wod log`
+    const db = getDb();
+    const workoutRepo = new WorkoutRepository(db);
+    workoutRepo.save(workout);
+
     console.log("\n" + formatWorkoutDisplay(workout));
+    console.log(`  Workout ID: ${workout.id}`);
+    console.log(`  Log your result: wod log -w ${workout.id}\n`);
   });
+
+// ─── MOVEMENTS ────────────────────────────────────────────────────
 
 program
   .command("movements")
@@ -81,7 +195,328 @@ program
     console.log();
   });
 
-function formatWorkoutDisplay(workout: any): string {
+// ─── LOG ──────────────────────────────────────────────────────────
+
+program
+  .command("log")
+  .description("Log a workout result")
+  .requiredOption("-w, --workout <id>", "Workout ID (from `wod generate`)")
+  .option("--time <seconds>", "Time in seconds (for ForTime/RoundsForTime)")
+  .option("--rounds <count>", "Rounds completed (for AMRAP)")
+  .option("--reps <count>", "Partial reps / total reps")
+  .option("--load <lbs>", "Peak load in lbs (for Strength)")
+  .option("--calories <cal>", "Total calories")
+  .option("--distance <meters>", "Total distance in meters")
+  .option("--rpe <value>", "Rate of perceived exertion (1-10)")
+  .option("--rx", "Workout completed as prescribed", false)
+  .option("--notes <text>", "Notes about the workout")
+  .action((opts) => {
+    const db = getDb();
+    const workoutRepo = new WorkoutRepository(db);
+    const resultRepo = new ResultRepository(db);
+    const prTracker = new PRTracker(db);
+
+    const workout = workoutRepo.getById(opts.workout);
+    if (!workout) {
+      console.error(`\nWorkout not found: ${opts.workout}`);
+      console.error("Run `wod generate` first to create a workout.\n");
+      process.exit(1);
+    }
+
+    const a = resolveAthlete({});
+    const result = createWorkoutResult(
+      a.id,
+      workout.id,
+      workout.scoreType,
+      opts.rx ?? false
+    );
+
+    // Populate score fields based on what the user provided
+    if (opts.time) result.timeSeconds = parseFloat(opts.time);
+    if (opts.rounds) result.roundsCompleted = parseInt(opts.rounds, 10);
+    if (opts.reps) result.partialReps = parseInt(opts.reps, 10);
+    if (opts.load) result.peakLoad = parseFloat(opts.load);
+    if (opts.calories) result.totalCalories = parseFloat(opts.calories);
+    if (opts.distance) result.totalDistance = parseFloat(opts.distance);
+    if (opts.rpe) result.rpe = parseFloat(opts.rpe);
+    if (opts.notes) result.notes = opts.notes;
+
+    // Build movement results from workout prescription
+    result.movementResults = workout.movements.map((m) => ({
+      movementId: m.movementId,
+      load: opts.load ? parseFloat(opts.load) : m.load,
+      reps: m.reps,
+      rx: opts.rx ?? false,
+    }));
+
+    resultRepo.save(result);
+
+    console.log("\n" + "═".repeat(50));
+    console.log("  Result Logged!");
+    console.log("═".repeat(50));
+    console.log(`  Workout: ${workout.name}`);
+    console.log(`  Date: ${new Date(result.performedAt).toLocaleDateString()}`);
+
+    if (result.timeSeconds !== undefined) {
+      const mins = Math.floor(result.timeSeconds / 60);
+      const secs = Math.round(result.timeSeconds % 60);
+      console.log(`  Time: ${mins}:${secs.toString().padStart(2, "0")}`);
+    }
+    if (result.roundsCompleted !== undefined) {
+      const partial = result.partialReps ? ` + ${result.partialReps} reps` : "";
+      console.log(`  Score: ${result.roundsCompleted} rounds${partial}`);
+    }
+    if (result.peakLoad !== undefined) {
+      console.log(`  Peak Load: ${result.peakLoad} lbs`);
+    }
+    if (result.rpe !== undefined) {
+      console.log(`  RPE: ${result.rpe}/10`);
+    }
+    if (result.rx) {
+      console.log("  Rx: Yes");
+    }
+
+    // Detect PRs
+    const newPRs = prTracker.detectAndSavePRs(result);
+    if (newPRs.length > 0) {
+      console.log("");
+      console.log("  *** NEW PERSONAL RECORDS ***");
+      for (const pr of newPRs) {
+        const name =
+          pr.referenceType === "movement"
+            ? getMovement(pr.referenceId)?.name ?? pr.referenceId
+            : workout.name;
+        const improvement =
+          pr.previousValue !== undefined
+            ? ` (prev: ${formatPRValue(pr.previousValue, pr.unit)})`
+            : "";
+        console.log(
+          `  PR: ${name} - ${pr.category}: ${formatPRValue(pr.value, pr.unit)}${improvement}`
+        );
+      }
+    }
+
+    console.log("═".repeat(50) + "\n");
+  });
+
+// ─── HISTORY ──────────────────────────────────────────────────────
+
+program
+  .command("history")
+  .description("View past workout results")
+  .option("-n, --limit <count>", "Number of results to show", "10")
+  .action((opts) => {
+    const db = getDb();
+    const resultRepo = new ResultRepository(db);
+    const workoutRepo = new WorkoutRepository(db);
+    const a = resolveAthlete({});
+
+    const limit = parseInt(opts.limit, 10);
+    const results = resultRepo.getByAthlete(a.id, limit);
+
+    if (results.length === 0) {
+      console.log("\nNo workout results found. Log one with `wod log`.\n");
+      return;
+    }
+
+    console.log(`\nLast ${results.length} workout${results.length > 1 ? "s" : ""}:\n`);
+    console.log(
+      "  " +
+        "Date".padEnd(12) +
+        "Workout".padEnd(30) +
+        "Score".padEnd(20) +
+        "Rx"
+    );
+    console.log("  " + "-".repeat(64));
+
+    for (const r of results) {
+      const workout = workoutRepo.getById(r.workoutId);
+      const name = workout
+        ? workout.name.slice(0, 28)
+        : r.workoutId.slice(0, 28);
+      const date = new Date(r.performedAt).toLocaleDateString();
+      const score = formatScore(r);
+      const rx = r.rx ? "Rx" : "";
+
+      console.log(
+        `  ${date.padEnd(12)}${name.padEnd(30)}${score.padEnd(20)}${rx}`
+      );
+    }
+    console.log();
+  });
+
+// ─── PRS ──────────────────────────────────────────────────────────
+
+program
+  .command("prs")
+  .description("View personal records")
+  .option("-m, --movement <id>", "Filter by movement ID")
+  .action((opts) => {
+    const db = getDb();
+    const prTracker = new PRTracker(db);
+    const a = resolveAthlete({});
+
+    let prs;
+    if (opts.movement) {
+      prs = prTracker.getMovementPRs(a.id, opts.movement);
+    } else {
+      prs = prTracker.getAllPRs(a.id);
+    }
+
+    if (prs.length === 0) {
+      console.log("\nNo personal records yet. Log workouts to start tracking PRs.\n");
+      return;
+    }
+
+    // Group by reference
+    const grouped = new Map<string, typeof prs>();
+    for (const pr of prs) {
+      const key = `${pr.referenceType}:${pr.referenceId}`;
+      const group = grouped.get(key) ?? [];
+      group.push(pr);
+      grouped.set(key, group);
+    }
+
+    console.log("\n" + "═".repeat(50));
+    console.log("  Personal Records");
+    console.log("═".repeat(50));
+
+    for (const [key, records] of grouped) {
+      const [type, refId] = key.split(":");
+      const name =
+        type === "movement"
+          ? getMovement(refId)?.name ?? refId
+          : refId;
+
+      console.log(`\n  ${name} (${type}):`);
+      for (const pr of records) {
+        const date = new Date(pr.achievedAt).toLocaleDateString();
+        console.log(
+          `    ${pr.category.padEnd(16)} ${formatPRValue(pr.value, pr.unit).padEnd(14)} ${date}`
+        );
+      }
+    }
+
+    console.log("\n" + "═".repeat(50) + "\n");
+  });
+
+// ─── VOLUME ───────────────────────────────────────────────────────
+
+program
+  .command("volume")
+  .alias("vol")
+  .description("View training volume summary")
+  .option("-p, --period <period>", "Period: week or month", "week")
+  .action((opts) => {
+    const db = getDb();
+    const volumeTracker = new VolumeTracker(db);
+    const a = resolveAthlete({});
+
+    const summary =
+      opts.period === "month"
+        ? volumeTracker.monthSummary(a.id)
+        : volumeTracker.weekSummary(a.id);
+
+    const periodLabel = opts.period === "month" ? "30-Day" : "7-Day";
+
+    console.log("\n" + "═".repeat(50));
+    console.log(`  ${periodLabel} Volume Summary`);
+    console.log("═".repeat(50));
+    console.log(`  Total Workouts: ${summary.totalWorkouts}`);
+    console.log(`  Rx Workouts: ${summary.rxWorkouts}`);
+    console.log(
+      `  Total Volume: ${summary.totalVolumeLbs.toLocaleString()} lbs`
+    );
+    if (summary.averageRpe !== null) {
+      console.log(`  Average RPE: ${summary.averageRpe}/10`);
+    }
+
+    if (summary.movementBreakdown.length > 0) {
+      console.log("\n  Top Movements:");
+      for (const mv of summary.movementBreakdown.slice(0, 8)) {
+        const name = getMovement(mv.movementId)?.name ?? mv.movementId;
+        const loadStr =
+          mv.maxLoad > 0 ? ` (max: ${mv.maxLoad} lbs)` : "";
+        console.log(
+          `    ${name.padEnd(25)} ${String(mv.totalReps).padEnd(6)} reps${loadStr}`
+        );
+      }
+    }
+
+    const days = ["Sun", "Mon", "Tue", "Wed", "Thu", "Fri", "Sat"];
+    const hasActivity = summary.dayDistribution.some((d) => d > 0);
+    if (hasActivity) {
+      console.log("\n  Training Days:");
+      console.log(
+        "    " +
+          days.map((d, i) => `${d}: ${summary.dayDistribution[i]}`).join("  ")
+      );
+    }
+
+    console.log("\n" + "═".repeat(50) + "\n");
+  });
+
+// ─── SCALE ────────────────────────────────────────────────────────
+
+program
+  .command("scale")
+  .description("Scale a workout to a different difficulty tier")
+  .requiredOption("-w, --workout <id>", "Workout ID")
+  .option(
+    "-t, --tier <tier>",
+    "Target tier (beginner, intermediate, advanced, rx, rx_plus)",
+    "intermediate"
+  )
+  .action((opts) => {
+    const db = getDb();
+    const workoutRepo = new WorkoutRepository(db);
+    const a = resolveAthlete({});
+
+    const workout = workoutRepo.getById(opts.workout);
+    if (!workout) {
+      console.error(`\nWorkout not found: ${opts.workout}`);
+      console.error("Run `wod generate` first to create a workout.\n");
+      process.exit(1);
+    }
+
+    const tierMap: Record<string, DifficultyTier> = {
+      beginner: DifficultyTier.Beginner,
+      intermediate: DifficultyTier.Intermediate,
+      advanced: DifficultyTier.Advanced,
+      rx: DifficultyTier.Rx,
+      rx_plus: DifficultyTier.RxPlus,
+    };
+
+    const tier = tierMap[opts.tier];
+    if (!tier) {
+      console.error(`\nUnknown tier: ${opts.tier}`);
+      console.error(
+        "Valid tiers: beginner, intermediate, advanced, rx, rx_plus\n"
+      );
+      process.exit(1);
+    }
+
+    const scaled = scaleWorkoutToTier(workout, tier, a.equipment);
+
+    console.log("\n" + formatWorkoutDisplay(scaled.workout));
+
+    if (scaled.scalingNotes.length > 0) {
+      console.log("  Scaling Notes:");
+      for (const note of scaled.scalingNotes) {
+        for (const change of note.changes) {
+          if (change !== "kept") {
+            console.log(`    ${note.originalName}: ${change}`);
+          }
+        }
+      }
+    }
+
+    console.log();
+  });
+
+// ─── Formatting Helpers ───────────────────────────────────────────
+
+function formatWorkoutDisplay(workout: Workout): string {
   const lines: string[] = [];
   lines.push("═".repeat(50));
   lines.push(`  ${workout.name}`);
@@ -95,11 +530,15 @@ function formatWorkoutDisplay(workout: any): string {
       `  ${workout.emomMinutes}-Minute EMOM (${workout.movements.length} stations):`
     );
   } else if (workout.format === "for_time") {
-    lines.push(`  For Time${workout.timeCap ? ` (${workout.timeCap} min cap)` : ""}:`);
+    lines.push(
+      `  For Time${workout.timeCap ? ` (${workout.timeCap} min cap)` : ""}:`
+    );
   } else if (workout.format === "rounds_for_time" && workout.rounds) {
     lines.push(`  ${workout.rounds} Rounds For Time:`);
   } else if (workout.format === "chipper") {
-    lines.push(`  Chipper${workout.timeCap ? ` (${workout.timeCap} min cap)` : ""}:`);
+    lines.push(
+      `  Chipper${workout.timeCap ? ` (${workout.timeCap} min cap)` : ""}:`
+    );
   } else {
     lines.push(`  ${workout.format.toUpperCase()}:`);
   }
@@ -123,6 +562,75 @@ function formatWorkoutDisplay(workout: any): string {
   }
   lines.push("═".repeat(50));
   return lines.join("\n");
+}
+
+function formatScore(result: {
+  scoreType: ScoreType;
+  timeSeconds?: number;
+  roundsCompleted?: number;
+  partialReps?: number;
+  peakLoad?: number;
+  totalReps?: number;
+  totalCalories?: number;
+  totalDistance?: number;
+}): string {
+  switch (result.scoreType) {
+    case ScoreType.Time:
+      if (result.timeSeconds !== undefined) {
+        const mins = Math.floor(result.timeSeconds / 60);
+        const secs = Math.round(result.timeSeconds % 60);
+        return `${mins}:${secs.toString().padStart(2, "0")}`;
+      }
+      return "-";
+    case ScoreType.RoundsAndReps: {
+      if (result.roundsCompleted !== undefined) {
+        const partial = result.partialReps
+          ? ` + ${result.partialReps}`
+          : "";
+        return `${result.roundsCompleted} rds${partial}`;
+      }
+      return "-";
+    }
+    case ScoreType.Load:
+      return result.peakLoad !== undefined ? `${result.peakLoad} lbs` : "-";
+    case ScoreType.Reps:
+      return result.totalReps !== undefined ? `${result.totalReps} reps` : "-";
+    case ScoreType.Calories:
+      return result.totalCalories !== undefined
+        ? `${result.totalCalories} cal`
+        : "-";
+    case ScoreType.Distance:
+      return result.totalDistance !== undefined
+        ? `${result.totalDistance}m`
+        : "-";
+    default:
+      return "-";
+  }
+}
+
+function formatPRValue(value: number, unit: string): string {
+  switch (unit) {
+    case "seconds": {
+      const mins = Math.floor(value / 60);
+      const secs = Math.round(value % 60);
+      return `${mins}:${secs.toString().padStart(2, "0")}`;
+    }
+    case "lbs":
+      return `${value} lbs`;
+    case "reps":
+      return `${value} reps`;
+    case "rounds_reps": {
+      const rounds = Math.floor(value / 1000);
+      const reps = value % 1000;
+      return reps > 0 ? `${rounds}+${reps}` : `${rounds} rds`;
+    }
+    case "calories":
+      return `${value} cal`;
+    case "meters":
+      return `${value}m`;
+    default:
+      return `${value}`;
+  }
 }
 
 program.parse();
