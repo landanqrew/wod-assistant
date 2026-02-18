@@ -1,6 +1,6 @@
 # WOD Assistant
 
-A CLI fitness programming utility for CrossFit-style workouts. Generate workouts, browse benchmark WODs, build full training sessions with warm-ups, log results, track personal records, and monitor training volume -- all stored locally in SQLite.
+A CLI fitness programming utility for CrossFit-style workouts. Generate workouts, browse benchmark WODs, build full training sessions with warm-ups, log results, track personal records, monitor training volume, detect programming biases, and visualize progress -- all stored locally in SQLite.
 
 ## Install
 
@@ -39,6 +39,12 @@ wod prs
 
 # 5. Review your week
 wod volume
+
+# 6. Check for training blind spots
+wod insights
+
+# 7. Visualize progress
+wod progress
 ```
 
 ## Commands
@@ -306,5 +312,5 @@ src/
   models/       TypeScript interfaces and enums
   movements/    Movement library (68 movements)
   scaling/      Constraint engine, substitution, scaling tiers
-  tracking/     PR detection, volume summaries
+  tracking/     PR detection, volume summaries, bias detection, fatigue tracking, charts
 ```
