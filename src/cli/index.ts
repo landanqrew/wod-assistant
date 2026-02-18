@@ -2,6 +2,12 @@
 
 import { Command } from "commander";
 import { generateWorkout } from "../generator/index.js";
+import {
+  getAllBenchmarks,
+  getBenchmark,
+  getBenchmarksByCategory,
+} from "../generator/benchmark-library.js";
+import { buildSession } from "../generator/session-builder.js";
 import { createAthlete, Sex } from "../models/athlete.js";
 import type { Workout } from "../models/workout.js";
 import { WorkoutFormat, ScoreType } from "../models/workout.js";
@@ -149,20 +155,37 @@ program
     "full_gym"
   )
   .option("-s, --sex <sex>", "Sex for Rx loads (male, female)", "male")
+  .option(
+    "-b, --benchmark <name>",
+    "Use a named benchmark WOD (e.g., fran, grace, murph)"
+  )
   .action((opts) => {
-    const a = resolveAthlete(opts);
-
-    const format = opts.format as WorkoutFormat;
-    const workout = generateWorkout(a, {
-      format,
-      movementCount: parseInt(opts.movements, 10),
-      timeCap: opts.time ? parseInt(opts.time, 10) : undefined,
-      rounds: opts.rounds ? parseInt(opts.rounds, 10) : undefined,
-    });
-
-    // Save workout to DB so it can be referenced by `wod log`
     const db = getDb();
     const workoutRepo = new WorkoutRepository(db);
+
+    let workout: Workout;
+
+    if (opts.benchmark) {
+      const bm = getBenchmark(opts.benchmark);
+      if (!bm) {
+        console.error(`\nBenchmark not found: "${opts.benchmark}"`);
+        console.error("Run `wod benchmark list` to see available benchmarks.\n");
+        process.exit(1);
+      }
+      // Give it a unique ID so it can be saved / logged
+      workout = { ...bm, id: `wod_${Date.now()}_${Math.random().toString(36).slice(2, 8)}` };
+    } else {
+      const a = resolveAthlete(opts);
+      const format = opts.format as WorkoutFormat;
+      workout = generateWorkout(a, {
+        format,
+        movementCount: parseInt(opts.movements, 10),
+        timeCap: opts.time ? parseInt(opts.time, 10) : undefined,
+        rounds: opts.rounds ? parseInt(opts.rounds, 10) : undefined,
+      });
+    }
+
+    // Save workout to DB so it can be referenced by `wod log`
     workoutRepo.save(workout);
 
     console.log("\n" + formatWorkoutDisplay(workout));
@@ -381,12 +404,17 @@ program
     console.log("  Personal Records");
     console.log("═".repeat(50));
 
+    const workoutRepo = new WorkoutRepository(db);
+
     for (const [key, records] of grouped) {
       const [type, refId] = key.split(":");
-      const name =
-        type === "movement"
-          ? getMovement(refId)?.name ?? refId
-          : refId;
+      let name: string;
+      if (type === "movement") {
+        name = getMovement(refId)?.name ?? refId;
+      } else {
+        const w = workoutRepo.getById(refId);
+        name = w?.name ?? refId;
+      }
 
       console.log(`\n  ${name} (${type}):`);
       for (const pr of records) {
@@ -512,6 +540,195 @@ program
     }
 
     console.log();
+  });
+
+// ─── BENCHMARK ───────────────────────────────────────────────────
+
+const benchmarkCmd = program
+  .command("benchmark")
+  .alias("bm")
+  .description("Browse and use benchmark workouts (The Girls, Hero WODs, etc.)");
+
+benchmarkCmd
+  .command("list")
+  .description("List all benchmark workouts")
+  .option(
+    "-c, --category <cat>",
+    "Filter by category (girl, hero, open)"
+  )
+  .action((opts) => {
+    const benchmarks = opts.category
+      ? getBenchmarksByCategory(opts.category)
+      : getAllBenchmarks();
+
+    if (benchmarks.length === 0) {
+      console.log("\nNo benchmarks found.\n");
+      return;
+    }
+
+    console.log(`\n${benchmarks.length} benchmark workouts:\n`);
+    console.log(
+      "  " +
+        "Name".padEnd(20) +
+        "Category".padEnd(10) +
+        "Format".padEnd(18) +
+        "Est. Duration"
+    );
+    console.log("  " + "-".repeat(60));
+
+    for (const bm of benchmarks) {
+      const dur = bm.estimatedDuration ? `~${bm.estimatedDuration} min` : "-";
+      console.log(
+        `  ${bm.name.padEnd(20)}${bm.category.padEnd(10)}${bm.format.padEnd(18)}${dur}`
+      );
+    }
+
+    console.log("\n  Use `wod benchmark show <name>` for details.");
+    console.log("  Use `wod generate --benchmark <name>` to start one.\n");
+  });
+
+benchmarkCmd
+  .command("show <name>")
+  .description("Show details of a benchmark workout")
+  .action((name) => {
+    const bm = getBenchmark(name);
+    if (!bm) {
+      console.error(`\nBenchmark not found: "${name}"`);
+      console.error("Run `wod benchmark list` to see available benchmarks.\n");
+      process.exit(1);
+    }
+
+    console.log("\n" + formatWorkoutDisplay(bm));
+
+    if (bm.description) {
+      console.log(`\n  ${bm.description}`);
+    }
+    console.log(`  Category: ${bm.category}`);
+
+    // Check for previous attempts
+    const db = getDb();
+    const workoutRepo = new WorkoutRepository(db);
+    const resultRepo = new ResultRepository(db);
+    const a = resolveAthlete({});
+
+    // Find all saved instances of this benchmark
+    const savedBenchmarks = workoutRepo.getBenchmarks().filter(
+      (w) => w.name === bm.name
+    );
+
+    if (savedBenchmarks.length > 0) {
+      const allResults = savedBenchmarks.flatMap((w) =>
+        resultRepo.getByAthleteAndWorkout(a.id, w.id)
+      );
+
+      if (allResults.length > 0) {
+        console.log(`\n  Previous attempts (${allResults.length}):`);
+        for (const r of allResults.slice(0, 5)) {
+          const date = new Date(r.performedAt).toLocaleDateString();
+          const score = formatScore(r);
+          const rx = r.rx ? " (Rx)" : "";
+          console.log(`    ${date}  ${score}${rx}`);
+        }
+      }
+    }
+
+    console.log(`\n  Start this workout: wod generate --benchmark ${name}\n`);
+  });
+
+// ─── SESSION ─────────────────────────────────────────────────────
+
+program
+  .command("session")
+  .description("Generate a full training session (warm-up + WOD + cool-down)")
+  .option(
+    "-d, --duration <minutes>",
+    "Total session duration in minutes",
+    "60"
+  )
+  .option(
+    "-f, --format <format>",
+    "WOD format (amrap, emom, for_time, rounds_for_time, tabata, chipper, ladder, strength)",
+    "amrap"
+  )
+  .option("-m, --movements <count>", "Number of movements in WOD", "3")
+  .option(
+    "-b, --benchmark <name>",
+    "Use a named benchmark WOD"
+  )
+  .option("--no-warmup", "Skip warm-up block")
+  .option("--no-cooldown", "Skip cool-down block")
+  .action((opts) => {
+    const a = resolveAthlete({});
+    const db = getDb();
+    const workoutRepo = new WorkoutRepository(db);
+
+    let providedWorkout: Workout | undefined;
+
+    if (opts.benchmark) {
+      const bm = getBenchmark(opts.benchmark);
+      if (!bm) {
+        console.error(`\nBenchmark not found: "${opts.benchmark}"`);
+        console.error("Run `wod benchmark list` to see available benchmarks.\n");
+        process.exit(1);
+      }
+      providedWorkout = {
+        ...bm,
+        id: `wod_${Date.now()}_${Math.random().toString(36).slice(2, 8)}`,
+      };
+    }
+
+    const result = buildSession(a, {
+      totalMinutes: parseInt(opts.duration, 10),
+      includeWarmUp: opts.warmup !== false,
+      includeCoolDown: opts.cooldown !== false,
+      workout: providedWorkout,
+      generateOptions: providedWorkout
+        ? undefined
+        : {
+            format: opts.format as WorkoutFormat,
+            movementCount: parseInt(opts.movements, 10),
+          },
+    });
+
+    // Save the WOD to DB
+    const wodBlock = result.session.blocks.find((b) => b.workout);
+    if (wodBlock?.workout) {
+      workoutRepo.save(wodBlock.workout);
+    }
+
+    // Display session
+    console.log("\n" + "═".repeat(50));
+    console.log(`  Training Session - ${result.session.date}`);
+    console.log(`  Total Duration: ~${result.session.totalDurationMinutes} min`);
+    console.log("═".repeat(50));
+
+    for (const block of result.session.blocks) {
+      const label = block.type.replace(/_/g, " ").toUpperCase();
+      console.log(`\n  ── ${label} (~${block.durationMinutes} min) ──`);
+
+      if (block.workout) {
+        console.log("");
+        // Display the workout
+        const wDisplay = formatWorkoutDisplay(block.workout);
+        // Indent the workout display
+        for (const line of wDisplay.split("\n")) {
+          console.log(`  ${line}`);
+        }
+      }
+
+      if (block.notes && !block.workout) {
+        for (const line of block.notes.split("\n")) {
+          console.log(`    ${line}`);
+        }
+      }
+    }
+
+    if (wodBlock?.workout) {
+      console.log(`\n  Workout ID: ${wodBlock.workout.id}`);
+      console.log(`  Log your result: wod log -w ${wodBlock.workout.id}`);
+    }
+
+    console.log("\n" + "═".repeat(50) + "\n");
   });
 
 // ─── Formatting Helpers ───────────────────────────────────────────
