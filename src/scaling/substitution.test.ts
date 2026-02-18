@@ -59,7 +59,7 @@ describe("findSubstitution", () => {
     expect(result.replacement!.tags).not.toContain("inverted");
   });
 
-  it("finds a non-overhead substitute during pregnancy T3", () => {
+  it("finds a non-overhead substitute during pregnancy T3 via broad search", () => {
     const strictPress = getMovementOrThrow("strict_press");
     const constraints = buildPregnancyConstraints(3);
     const result = findSubstitution(
@@ -67,17 +67,25 @@ describe("findSubstitution", () => {
       constraints,
       EQUIPMENT_PRESETS.fullGym
     );
-    // strict_press subs: dumbbell_press, push_press
-    // Both are overhead, so might get push_up from dumbbell_press chain
-    // or null if all subs are also overhead
-    // dumbbell_press subs: push_up -- push_up is not overhead!
-    // But dumbbell_press itself IS overhead, so it won't be selected.
-    // The engine walks strict_press's direct substitutions only.
-    // So if all of strict_press's subs are overhead, result will be null.
-    // That's ok -- it means we need broader search (future feature)
-    if (result.replacement) {
-      expect(result.replacement.tags).not.toContain("overhead");
-    }
+    // strict_press subs: dumbbell_press, push_press -- both overhead
+    // Broader search should find a Push-group movement that isn't overhead
+    // (e.g., push_up, bench_press, floor_press)
+    expect(result.replacement).not.toBeNull();
+    expect(result.replacement!.tags).not.toContain("overhead");
+    expect(result.replacement!.muscleGroups).toContain("push");
+  });
+
+  it("includes fallback warning when using broad muscle-group search", () => {
+    const strictPress = getMovementOrThrow("strict_press");
+    const constraints = buildPregnancyConstraints(3);
+    const result = findSubstitution(
+      strictPress,
+      constraints,
+      EQUIPMENT_PRESETS.fullGym
+    );
+    expect(result.replacementWarnings).toContain(
+      "Substituted via muscle-group fallback (not a direct substitution)"
+    );
   });
 
   it("applies load scaling when constraints cap load", () => {
